@@ -17,7 +17,8 @@ COPY --chown=pptruser:pptruser index.js auth.js entrypoint.sh ./
 # Directorio de sesión (sobreescrito por el volumen en docker-compose)
 RUN mkdir -p /home/pptruser/app/.wwebjs_auth
 
-# Dar permiso de ejecución al script de entrada
-RUN chmod +x /home/pptruser/app/entrypoint.sh
+# Normalizar saltos de línea (CRLF→LF) y dar permiso de ejecución
+RUN sed -i 's/\r//' /home/pptruser/app/entrypoint.sh && \
+    chmod +x /home/pptruser/app/entrypoint.sh
 
 ENTRYPOINT ["/home/pptruser/app/entrypoint.sh"]
