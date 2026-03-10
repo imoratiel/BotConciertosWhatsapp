@@ -1,0 +1,42 @@
+services:
+  whatsapp-calendar-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wa-calendar-bot
+    restart: unless-stopped       # se relanza solo tras reinicios de Docker Desktop
+
+    # ── Variables de entorno ────────────────────────────────────────────────
+    env_file:
+      - .env                      # lee tu archivo .env local
+
+    # ── Volúmenes ───────────────────────────────────────────────────────────
+    volumes:
+      # Sesión de WhatsApp: volumen Docker nombrado → sobrevive a reinicios
+      # Ruta dentro del contenedor: WORKDIR de la imagen puppeteer oficial
+      - whatsapp_session:/home/pptruser/app/.wwebjs_auth
+
+      # Credenciales de Google: montadas en modo solo lectura desde el host
+      - ./credentials.json:/home/pptruser/app/credentials.json:ro
+
+      # Token de Google: lectura/escritura para que se pueda renovar automáticamente
+      - ./token.json:/home/pptruser/app/token.json
+
+    # ── Puerto de pruebas (solo si TEST_PORT está en .env) ───────────────────
+    ports:
+      - "${TEST_PORT:-3099}:${TEST_PORT:-3099}"
+
+    # ── Recursos ─────────────────────────────────────────────────────────────
+    # /dev/shm aumentado para evitar crashes de Chromium en entornos Docker
+    shm_size: '256mb'
+
+    # ── Logs ─────────────────────────────────────────────────────────────────
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Volumen nombrado: Docker Desktop lo gestiona y persiste aunque el contenedor se elimine
+volumes:
+  whatsapp_session:

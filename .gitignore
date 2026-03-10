@@ -1,0 +1,16 @@
+node_modules/
+
+# Credenciales y tokens — NUNCA subir al repo
+.env
+credentials.json
+token.json
+
+# Sesión de WhatsApp (puede contener datos sensibles)
+.wwebjs_auth/
+.wwebjs_cache/
+
+# Logs
+bot.log
+
+# IDE
+.claude/

@@ -1,0 +1,16 @@
+# Dependencias locales (se instalan dentro del contenedor)
+node_modules/
+
+# Sesión de WhatsApp local (el contenedor usa su propio volumen)
+.wwebjs_auth/
+
+# Archivos de entorno — se montan en runtime, no se copian a la imagen
+.env
+token.json
+
+# Archivos que el contenedor no necesita
+.git/
+.gitignore
+*.md
+docker-compose.yml
+Dockerfile
