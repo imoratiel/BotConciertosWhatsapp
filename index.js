@@ -1,10 +1,10 @@
 /**
- * index.js — WhatsApp → Google Calendar Bot
+ * index.js — WhatsApp → Google Calendar Bot (Baileys edition)
  *
  * Flujo:
- *  1. WhatsApp Web se conecta vía whatsapp-web.js (sesión persistente con LocalAuth).
+ *  1. WhatsApp se conecta vía Baileys (WebSocket nativo, sin browser).
  *  2. Solo se procesan mensajes del grupo configurado en WHATSAPP_GROUP_ID.
- *  3. Claude analiza imágenes, links y texto para detectar anuncios de conciertos.
+ *  3. Groq analiza imágenes, links y texto para detectar anuncios de conciertos.
  *  4. createCalendarEvent() inserta el evento en Google Calendar (con comprobación de duplicados).
  *  5. Se aplica un delay humano (5-12 s) antes de cualquier respuesta al chat.
  *
@@ -17,11 +17,18 @@ require('dotenv').config();
 
 const path = require('path');
 const fs   = require('fs');
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode                = require('qrcode-terminal');
-const { google }            = require('googleapis');
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  downloadMediaMessage,
+  fetchLatestBaileysVersion,
+} = require('@whiskeysockets/baileys');
+const qrcode             = require('qrcode-terminal');
+const pino               = require('pino');
+const { google }         = require('googleapis');
 const { getAuthenticatedClient } = require('./auth');
-const Groq = require('groq-sdk');
+const Groq               = require('groq-sdk');
 
 // ─── Logging dual: consola + archivo ─────────────────────────────────────────
 const LOG_FILE = path.join(__dirname, 'bot.log');
@@ -36,29 +43,22 @@ const LOG_FILE = path.join(__dirname, 'bot.log');
   };
 });
 
-// Ruta absoluta para que LocalAuth y puppeteer coincidan siempre,
-// independientemente del directorio desde el que se ejecute node.
-const SESSION_DIR = path.join(__dirname, '.wwebjs_auth');
+const SESSION_DIR = path.join(__dirname, '.baileys_auth');
 
 // ─── Variables de entorno ─────────────────────────────────────────────────────
-const TIMEZONE        = process.env.TIMEZONE         || 'Europe/Madrid';
-const GROUP_ID        = process.env.WHATSAPP_GROUP_ID || '';   // vacío = deshabilitado
-const CALENDAR_ID     = process.env.GOOGLE_CALENDAR_ID || 'primary';
-const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
+const TIMEZONE    = process.env.TIMEZONE            || 'Europe/Madrid';
+const GROUP_ID    = process.env.WHATSAPP_GROUP_ID   || '';
+const CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID  || 'primary';
+const GROQ_API_KEY = process.env.GROQ_API_KEY       || '';
 
 // ─── Cliente Groq (singleton) ─────────────────────────────────────────────────
 const groq = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY }) : null;
 
 // ─── Deduplicación de mensajes ────────────────────────────────────────────────
 
-const PROCESSED_FILE = path.join(__dirname, 'processed_messages.json');
-// Cuántos días guardar IDs (evita que el archivo crezca indefinidamente)
+const PROCESSED_FILE    = path.join(__dirname, 'processed_messages.json');
 const PROCESSED_TTL_DAYS = 7;
 
-/**
- * Carga los IDs de mensajes ya procesados desde disco.
- * Formato: { "msgId": timestampMs, ... }
- */
 function loadProcessedIds() {
   try {
     if (fs.existsSync(PROCESSED_FILE)) {
@@ -70,9 +70,6 @@ function loadProcessedIds() {
   return {};
 }
 
-/**
- * Guarda el mapa de IDs procesados en disco, descartando entradas antiguas.
- */
 function saveProcessedIds(map) {
   const cutoff = Date.now() - PROCESSED_TTL_DAYS * 24 * 60 * 60 * 1000;
   const pruned = Object.fromEntries(
@@ -86,28 +83,18 @@ function saveProcessedIds(map) {
   return pruned;
 }
 
-// Mapa en memoria { msgId → timestampMs }
 let processedIds = loadProcessedIds();
 console.log(`[dedup] 📋 IDs procesados en caché: ${Object.keys(processedIds).length}`);
 
 // ─── Utilidades ───────────────────────────────────────────────────────────────
 
-/**
- * Pausa aleatoria entre min y max segundos para simular comportamiento humano.
- * Evita patrones de respuesta robótica que activan sistemas anti-spam de WhatsApp.
- */
 function humanDelay(minSec = 5, maxSec = 12) {
   const ms = (Math.random() * (maxSec - minSec) + minSec) * 1000;
   console.log(`[bot] ⏳ Delay humano: ${(ms / 1000).toFixed(1)}s`);
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/**
- * Formatea una fecha Date a ISO 8601 con zona horaria local para Google Calendar.
- * Google Calendar acepta "YYYY-MM-DDTHH:mm:ss±HH:MM".
- */
 function toLocalISOString(date, tz = TIMEZONE) {
-  // Usamos Intl para obtener la representación local completa
   const formatter = new Intl.DateTimeFormat('sv-SE', {
     timeZone: tz,
     year:     'numeric',
@@ -118,26 +105,21 @@ function toLocalISOString(date, tz = TIMEZONE) {
     second:   '2-digit',
     hour12:   false,
   });
-  // sv-SE produce "YYYY-MM-DD HH:mm:ss" — reemplazamos el espacio por T
   const local = formatter.format(date).replace(' ', 'T');
 
-  // Calculamos el offset UTC para esa zona y fecha
-  const utcDate   = new Date(date.toLocaleString('en-US', { timeZone: 'UTC' }));
-  const tzDate    = new Date(date.toLocaleString('en-US', { timeZone: tz }));
-  const diffMin   = (tzDate - utcDate) / 60000;
-  const sign      = diffMin >= 0 ? '+' : '-';
-  const absDiff   = Math.abs(diffMin);
-  const hh        = String(Math.floor(absDiff / 60)).padStart(2, '0');
-  const mm        = String(absDiff % 60).padStart(2, '0');
+  const utcDate = new Date(date.toLocaleString('en-US', { timeZone: 'UTC' }));
+  const tzDate  = new Date(date.toLocaleString('en-US', { timeZone: tz }));
+  const diffMin = (tzDate - utcDate) / 60000;
+  const sign    = diffMin >= 0 ? '+' : '-';
+  const absDiff = Math.abs(diffMin);
+  const hh      = String(Math.floor(absDiff / 60)).padStart(2, '0');
+  const mm      = String(absDiff % 60).padStart(2, '0');
 
   return `${local}${sign}${hh}:${mm}`;
 }
 
-// ─── Claude — utilidades compartidas ─────────────────────────────────────────
+// ─── Groq — utilidades compartidas ───────────────────────────────────────────
 
-/**
- * Construye el prompt de extracción de conciertos que se reutiliza en imagen y texto.
- */
 function concertPrompt(todayStr, extra = '') {
   return (
     `Eres un asistente que detecta y extrae información de anuncios de conciertos y eventos musicales.\n\n` +
@@ -163,9 +145,6 @@ function concertPrompt(todayStr, extra = '') {
   );
 }
 
-/**
- * Convierte el JSON que devuelve Claude en el objeto de evento que espera createCalendarEvent.
- */
 function buildEventFromJson(parsed, description) {
   const tomorrow = () => { const d = new Date(); d.setDate(d.getDate() + 1); return d.toISOString().slice(0, 10); };
   const dateStr  = (parsed.date  && parsed.date  !== 'null') ? parsed.date  : tomorrow();
@@ -180,7 +159,7 @@ function buildEventFromJson(parsed, description) {
     const [eh, em] = parsed.endTime.split(':').map(Number);
     endDate.setHours(eh, em, 0, 0);
   } else {
-    endDate.setHours(endDate.getHours() + 2); // 2 h por defecto para conciertos
+    endDate.setHours(endDate.getHours() + 2);
   }
 
   const venue = [parsed.venue, parsed.city].filter(v => v && v !== 'null').join(', ');
@@ -193,27 +172,16 @@ function buildEventFromJson(parsed, description) {
   };
 }
 
-/**
- * Parsea la respuesta raw de Claude (puede venir con ```json```) y devuelve el objeto,
- * o null si Claude indica que no es un concierto.
- */
-function parseClaudeResponse(rawText) {
+function parseGroqResponse(rawText) {
   const clean = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
   if (clean === 'null' || clean === '') return null;
   return JSON.parse(clean);
 }
 
-/**
- * Extrae URLs de un texto.
- */
 function extractUrls(text) {
   return (text || '').match(/https?:\/\/[^\s<>"{}|\\^`[\]]+/g) || [];
 }
 
-/**
- * Descarga el contenido de una URL y devuelve el texto limpio (sin HTML).
- * Usa el fetch nativo de Node 18+.
- */
 async function fetchUrlText(url) {
   try {
     const res = await fetch(url, {
@@ -221,30 +189,23 @@ async function fetchUrlText(url) {
       signal: AbortSignal.timeout(12_000),
     });
     const html = await res.text();
-    const text = html
+    return html
       .replace(/<script[\s\S]*?<\/script>/gi, '')
       .replace(/<style[\s\S]*?<\/style>/gi, '')
       .replace(/<[^>]+>/g, ' ')
       .replace(/\s+/g, ' ')
       .trim()
       .slice(0, 6000);
-    return text;
   } catch (err) {
     console.warn(`[url] ⚠️  No se pudo descargar "${url}": ${err.message}`);
     return null;
   }
 }
 
-// ─── Groq Vision (cartel de concierto → imagen) ──────────────────────────────
+// ─── Groq Vision ──────────────────────────────────────────────────────────────
 
-/**
- * Envía una imagen a Groq vision y extrae los datos del evento.
- * Devuelve el objeto de evento o lanza un error si no puede procesarla.
- */
-async function parseImageWithClaude(media, captionText = '') {
-  if (!groq) {
-    throw new Error('GROQ_API_KEY no configurada — no se pueden procesar imágenes.');
-  }
+async function parseImageWithGroq(media, captionText = '') {
+  if (!groq) throw new Error('GROQ_API_KEY no configurada — no se pueden procesar imágenes.');
 
   console.log('[vision] 🖼️  Enviando imagen a Groq...');
 
@@ -252,7 +213,7 @@ async function parseImageWithClaude(media, captionText = '') {
     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: TIMEZONE,
   });
 
-  const extra = captionText ? `Pie de foto del mensaje: "${captionText}"\n\n` : '';
+  const extra  = captionText ? `Pie de foto del mensaje: "${captionText}"\n\n` : '';
   const prompt = concertPrompt(todayStr, extra) + '\n\nAnaliza la imagen adjunta.';
 
   const response = await groq.chat.completions.create({
@@ -271,7 +232,7 @@ async function parseImageWithClaude(media, captionText = '') {
   console.log('[vision] 📝 Respuesta:', rawText);
 
   let parsed;
-  try { parsed = parseClaudeResponse(rawText); }
+  try { parsed = parseGroqResponse(rawText); }
   catch (e) { throw new Error(`Respuesta no válida de Groq: ${rawText}`); }
 
   if (!parsed) throw new Error('Groq indica que la imagen no es un cartel de concierto.');
@@ -284,13 +245,9 @@ async function parseImageWithClaude(media, captionText = '') {
   return result;
 }
 
-// ─── Groq Texto (anuncio de concierto → texto / link) ────────────────────────
+// ─── Groq Texto ───────────────────────────────────────────────────────────────
 
-/**
- * Envía un texto (o contenido extraído de una URL) a Groq y extrae datos del evento.
- * Devuelve null si considera que no es un anuncio de concierto.
- */
-async function parseTextWithClaude(text) {
+async function parseTextWithGroq(text) {
   if (!groq) return null;
 
   console.log('[groq] 📝 Analizando texto...');
@@ -299,7 +256,7 @@ async function parseTextWithClaude(text) {
     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: TIMEZONE,
   });
 
-  const extra = `Texto a analizar:\n"${text.slice(0, 3000)}"\n\n`;
+  const extra  = `Texto a analizar:\n"${text.slice(0, 3000)}"\n\n`;
   const prompt = concertPrompt(todayStr, extra);
 
   const response = await groq.chat.completions.create({
@@ -312,7 +269,7 @@ async function parseTextWithClaude(text) {
   console.log('[groq] 📝 Respuesta:', rawText);
 
   try {
-    const parsed = parseClaudeResponse(rawText);
+    const parsed = parseGroqResponse(rawText);
     if (!parsed) return null;
     return buildEventFromJson(parsed, `Agendado automáticamente desde WhatsApp.\n\nMensaje original:\n"${text.slice(0, 500)}"`);
   } catch {
@@ -325,37 +282,22 @@ async function parseTextWithClaude(text) {
 
 let calendarClient = null;
 
-/**
- * Inicializa el cliente de Google Calendar (singleton).
- */
 function getCalendar() {
   if (!calendarClient) {
-    const auth      = getAuthenticatedClient();
-    calendarClient  = google.calendar({ version: 'v3', auth });
+    const auth     = getAuthenticatedClient();
+    calendarClient = google.calendar({ version: 'v3', auth });
   }
   return calendarClient;
 }
 
-/**
- * Inserta un evento en Google Calendar.
- *
- * @param {{ summary, description, startDateTime, endDateTime }} eventData
- * @returns {Promise<string>} — Link del evento creado
- */
 async function createCalendarEvent(eventData) {
   const calendar = getCalendar();
 
   const event = {
     summary:     eventData.summary,
     description: eventData.description,
-    start: {
-      dateTime: eventData.startDateTime,
-      timeZone: TIMEZONE,
-    },
-    end: {
-      dateTime: eventData.endDateTime,
-      timeZone: TIMEZONE,
-    },
+    start: { dateTime: eventData.startDateTime, timeZone: TIMEZONE },
+    end:   { dateTime: eventData.endDateTime,   timeZone: TIMEZONE },
     reminders: {
       useDefault: false,
       overrides: [
@@ -365,12 +307,9 @@ async function createCalendarEvent(eventData) {
     },
   };
 
-  const response = await calendar.events.insert({
-    calendarId: CALENDAR_ID,
-    resource:   event,
-  });
+  const response = await calendar.events.insert({ calendarId: CALENDAR_ID, resource: event });
+  const created  = response.data;
 
-  const created = response.data;
   console.log(`[calendar] ✅ Evento creado: "${created.summary}"`);
   console.log(`[calendar]    Inicio : ${created.start.dateTime}`);
   console.log(`[calendar]    Fin    : ${created.end.dateTime}`);
@@ -379,10 +318,6 @@ async function createCalendarEvent(eventData) {
   return created.htmlLink;
 }
 
-/**
- * Comprueba si ya existe un evento con el mismo título en el mismo día.
- * Devuelve el evento existente o null si no hay duplicado.
- */
 async function isDuplicateEvent(summary, startDateTime) {
   const calendar = getCalendar();
   const start    = new Date(startDateTime);
@@ -411,90 +346,22 @@ async function isDuplicateEvent(summary, startDateTime) {
   }
 }
 
-// ─── WhatsApp Client ──────────────────────────────────────────────────────────
-
-const client = new Client({
-  authStrategy: new LocalAuth({
-    clientId: 'calendar-bot',
-    dataPath: SESSION_DIR,  // ruta absoluta → la sesión siempre se encuentra
-  }),
-  puppeteer: {
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--disable-gpu',
-      '--disable-extensions',
-    ],
-  },
-  // User-Agent de Chrome real para minimizar detección
-  userAgent:
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
-    'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-    'Chrome/122.0.0.0 Safari/537.36',
-});
-
-// ─── Eventos del cliente ──────────────────────────────────────────────────────
-
-client.on('qr', (qr) => {
-  console.log('\n[whatsapp] 📱 Escanea este QR con tu WhatsApp:');
-  qrcode.generate(qr, { small: true });
-  console.log('[whatsapp] El QR expira en ~20 segundos. Si no lo ves, revisa la terminal.\n');
-});
-
-client.on('authenticated', () => {
-  console.log('[whatsapp] 🔐 Sesión autenticada correctamente.');
-});
-
-client.on('auth_failure', (msg) => {
-  console.error('[whatsapp] ❌ Fallo de autenticación:', msg);
-  console.error('           Borra la carpeta .wwebjs_auth/ y reinicia para generar un nuevo QR.');
-});
-
-client.on('ready', async () => {
-  console.log('\n[whatsapp] ✅ Bot conectado y listo.');
-  console.log(`[whatsapp]    Grupo vigilado  : ${GROUP_ID || '(ninguno configurado)'}`);
-  console.log(`[whatsapp]    Calendario      : ${CALENDAR_ID}`);
-  console.log('[whatsapp]    Escuchando mensajes...\n');
-
-  // Lista todos los grupos en los que está el bot al arrancar
-  try {
-    const chats = await client.getChats();
-    const groups = chats.filter(c => c.isGroup);
-    if (groups.length === 0) {
-      console.log('[grupos] ℹ️  El bot no pertenece a ningún grupo.');
-    } else {
-      console.log(`[grupos] 📋 Grupos disponibles (${groups.length}):`);
-      groups.forEach(g => {
-        console.log(`[grupos]    • "${g.name}" → ID: ${g.id._serialized}`);
-      });
-    }
-    console.log('');
-  } catch (err) {
-    console.warn('[grupos] No se pudo obtener la lista de grupos:', err.message);
-  }
-});
-
-client.on('disconnected', (reason) => {
-  console.warn('[whatsapp] ⚠️  Cliente desconectado:', reason);
-  console.warn('[whatsapp]    Intentando reconectar en 10 segundos...');
-  setTimeout(() => client.initialize(), 10_000);
-});
-
 // ─── Procesamiento de mensajes ────────────────────────────────────────────────
 
-/**
- * Lógica compartida entre 'message' (mensajes ajenos) y 'message_create' (propios).
- * Para el grupo vigilado procesamos AMBOS: otros miembros comparten carteles,
- * y tú mismo puedes reenviar o pegar anuncios desde tu teléfono.
- */
-async function handleMessage(message) {
+async function handleMessage(sock, msg) {
   try {
-    // ── Deduplicación por ID de mensaje ───────────────────────────────────────
-    const msgId = message.id?._serialized;
+    const { key, message: waMessage, pushName } = msg;
+
+    if (!waMessage) return; // status updates, reacciones, etc.
+
+    const chatId = key.remoteJid;
+    const fromMe = key.fromMe;
+
+    // ── Filtro: solo el grupo vigilado ────────────────────────────────────────
+    if (!GROUP_ID || chatId !== GROUP_ID) return;
+
+    // ── Deduplicación ─────────────────────────────────────────────────────────
+    const msgId = key.id;
     if (msgId) {
       if (processedIds[msgId]) {
         console.log(`[dedup] ⏭️  Mensaje ya procesado, ignorando: ${msgId}`);
@@ -504,45 +371,30 @@ async function handleMessage(message) {
       processedIds = saveProcessedIds(processedIds);
     }
 
-    const body    = message.body?.trim();
-    // Para mensajes propios, 'from' es tu número; el chat real está en 'to'.
-    // Para mensajes ajenos, 'from' ES el chat (grupo o contacto).
-    const chatId  = message.fromMe ? (message.to || message.from) : message.from;
-    const isGroup = chatId.endsWith('@g.us');
+    // ── Extraer body y tipo ───────────────────────────────────────────────────
+    const isImage = !!waMessage.imageMessage;
+    const body = (
+      waMessage.conversation ||
+      waMessage.extendedTextMessage?.text ||
+      (isImage ? waMessage.imageMessage?.caption : '') ||
+      ''
+    ).trim();
 
-    // ── Filtro: solo el grupo vigilado, nada más ─────────────────────────────
-    if (!GROUP_ID || chatId !== GROUP_ID) return;
-
-    // ── Log (solo mensajes del grupo) ─────────────────────────────────────────
-    const TYPE_EMOJI = {
-      chat: '💬', image: '🖼️ ', video: '🎥', audio: '🎵',
-      document: '📄', sticker: '🪄', location: '📍', contact: '👤', poll: '📊',
-    };
-    const typeIcon  = TYPE_EMOJI[message.type] || '❓';
-    const direction = message.fromMe ? '→ yo' : '← recibido';
-    const chatName  = isGroup
-      ? (await message.getChat().catch(() => null))?.name ?? chatId
-      : chatId;
-    const preview = body
-      ? `"${body.slice(0, 60)}${body.length > 60 ? '…' : ''}"`
-      : `(${message.type})`;
-    console.log(`[msg] ${typeIcon} ${direction} | ${isGroup ? '👥 ' : '👤 '}${chatName} | ${preview}`);
-
-    const isImage = message.hasMedia && message.type === 'image';
-    const urls    = extractUrls(body || '');
-
-    const contact    = await message.getContact().catch(() => null);
-    const senderName = contact?.pushname || contact?.number || (message.fromMe ? 'Tú' : 'Desconocido');
+    const senderName = pushName || (fromMe ? 'Tú' : 'Desconocido');
+    const urls       = extractUrls(body);
     const typeLabel  = isImage ? '🖼️  imagen' : (urls.length ? '🔗 link' : '📝 texto');
-    console.log(`\n[bot] 📨 ${senderName} | ${typeLabel} | "${(body || '').slice(0, 60)}"`);
+
+    console.log(`\n[bot] 📨 ${senderName} | ${typeLabel} | "${body.slice(0, 60)}"`);
 
     // ── Extraer datos del evento ──────────────────────────────────────────────
     let eventData = null;
 
     if (isImage) {
-      const media = await message.downloadMedia().catch(() => null);
-      if (!media) { console.log('[bot] ⚠️  No se pudo descargar la imagen. Ignorando.\n'); return; }
-      eventData   = await parseImageWithClaude(media, body || '');
+      const buffer = await downloadMediaMessage(msg, 'buffer', {}).catch(() => null);
+      if (!buffer) { console.log('[bot] ⚠️  No se pudo descargar la imagen.\n'); return; }
+      const mimetype = waMessage.imageMessage.mimetype || 'image/jpeg';
+      const media    = { data: buffer.toString('base64'), mimetype };
+      eventData = await parseImageWithGroq(media, body);
 
     } else if (urls.length > 0) {
       console.log(`[bot] 🔗 Descargando URL: ${urls[0]}`);
@@ -550,10 +402,10 @@ async function handleMessage(message) {
       const contextText = pageText
         ? `${body}\n\n--- Contenido de la página ---\n${pageText}`
         : body;
-      eventData = await parseTextWithClaude(contextText);
+      eventData = await parseTextWithGroq(contextText);
 
     } else {
-      eventData = await parseTextWithClaude(body || '');
+      eventData = await parseTextWithGroq(body || '');
     }
 
     if (!eventData) {
@@ -570,9 +422,9 @@ async function handleMessage(message) {
         `📅 ${eventData.startDateTime.slice(0, 10)}\n` +
         `🔗 ${existing.htmlLink}`;
       console.log('[bot] ℹ️  Duplicado —', existing.summary);
-      if (!message.fromMe) {
+      if (!fromMe) {
         await humanDelay(2, 4);
-        await message.reply(dupMsg).catch(() => {});
+        await sock.sendMessage(chatId, { text: dupMsg }, { quoted: msg }).catch(() => {});
       }
       return;
     }
@@ -586,9 +438,9 @@ async function handleMessage(message) {
       `🔚 *Fin:*   ${eventData.endDateTime}\n` +
       `🔗 ${eventLink}`;
     console.log('[bot] ✅ Agendado:', eventData.summary);
-    if (!message.fromMe) {
+    if (!fromMe) {
       await humanDelay();
-      await message.reply(successMsg).catch(() => {});
+      await sock.sendMessage(chatId, { text: successMsg }, { quoted: msg }).catch(() => {});
     }
 
   } catch (err) {
@@ -596,93 +448,68 @@ async function handleMessage(message) {
   }
 }
 
-// Mensajes de otros miembros
-client.on('message', (message) => handleMessage(message));
+// ─── WhatsApp Client (Baileys) ────────────────────────────────────────────────
 
-// Mensajes enviados por ti mismo (reenvíos de carteles, etc.)
-client.on('message_create', async (message) => {
-  if (!message.fromMe) return;
-  // Para mensajes propios, el destinatario está en 'to', no en 'from'
-  const dest = message.to || message.from;
-  if (!GROUP_ID || dest !== GROUP_ID) return;
-  await handleMessage(message);
-});
+async function startBot() {
+  const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+  const { version } = await fetchLatestBaileysVersion();
 
+  const sock = makeWASocket({
+    version,
+    auth:               state,
+    printQRInTerminal:  false,
+    logger:             pino({ level: 'silent' }),
+    // Necesario para retransmisión de mensajes offline
+    getMessage: async () => ({ conversation: '' }),
+  });
 
-// ─── Limpieza de locks de Chrome ─────────────────────────────────────────────
+  sock.ev.on('creds.update', saveCreds);
 
-/**
- * Elimina los archivos de bloqueo que Chrome deja al cerrarse de forma abrupta
- * (crash del contenedor, SIGKILL, reinicio de Docker, etc.).
- * Sin esta limpieza, puppeteer lanza "The browser is already running" en el
- * siguiente arranque porque el SingletonLock sigue en el directorio de sesión.
- */
-function clearChromeLocks() {
-  const fs = require('fs');
-  const os = require('os');
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
 
-  // LocalAuth crea el perfil en: SESSION_DIR/session-<clientId>/
-  const profileDir = path.join(SESSION_DIR, 'session-calendar-bot');
-
-  // ── 1. Locks dentro del directorio de perfil ─────────────────────────────
-  // Chrome crea SingletonLock; puppeteer v21 crea .puppeteer_lock / lockfile.
-  const profileLocks = [
-    'SingletonLock', 'SingletonCookie', 'SingletonSocket',
-    '.puppeteer_lock', 'lockfile',
-  ];
-  for (const file of profileLocks) {
-    const p = path.join(profileDir, file);
-    try {
-      if (fs.existsSync(p)) {
-        fs.rmSync(p, { force: true });
-        console.log(`[startup] 🔓 Lock eliminado (perfil): ${file}`);
-      }
-    } catch { /* ignorar */ }
-  }
-
-  // ── 2. Lock adyacente al directorio (<userDataDir>.puppeteer_lock) ────────
-  // Algunas versiones de puppeteer-core crean el lock JUNTO AL directorio.
-  const adjacentLock = `${profileDir}.puppeteer_lock`;
-  try {
-    if (fs.existsSync(adjacentLock)) {
-      fs.rmSync(adjacentLock, { force: true });
-      console.log('[startup] 🔓 Lock eliminado (adyacente)');
+    if (qr) {
+      console.log('\n[whatsapp] 📱 Escanea este QR con tu WhatsApp:');
+      qrcode.generate(qr, { small: true });
+      console.log('[whatsapp] El QR expira en ~20 segundos.\n');
     }
-  } catch { /* ignorar */ }
 
-  // ── 3. Locks en /tmp que sobreviven a reinicios del proceso ───────────────
-  // Docker restart no recrea /tmp; los locks de puppeteer/chrome persisten.
-  try {
-    const tmp = os.tmpdir();
-    for (const entry of fs.readdirSync(tmp)) {
-      if (/puppeteer|chrome/i.test(entry)) {
-        fs.rmSync(path.join(tmp, entry), { force: true, recursive: true });
-        console.log(`[startup] 🔓 Lock eliminado (tmp): ${entry}`);
+    if (connection === 'open') {
+      console.log('\n[whatsapp] ✅ Bot conectado y listo.');
+      console.log(`[whatsapp]    Grupo vigilado  : ${GROUP_ID || '(ninguno configurado)'}`);
+      console.log(`[whatsapp]    Calendario      : ${CALENDAR_ID}`);
+      console.log('[whatsapp]    Escuchando mensajes...\n');
+    }
+
+    if (connection === 'close') {
+      const code            = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = code !== DisconnectReason.loggedOut;
+      console.warn(`[whatsapp] ⚠️  Conexión cerrada (código: ${code}). Reconectar: ${shouldReconnect}`);
+      if (shouldReconnect) {
+        setTimeout(() => startBot(), 5_000);
+      } else {
+        console.error('[whatsapp] ❌ Sesión cerrada (loggedOut). Borra .baileys_auth/ y reinicia.');
       }
     }
-  } catch { /* /tmp puede tener entradas sin permisos — ignorar */ }
+  });
 
-  // ── 4. Log de diagnóstico: muestra qué hay en el directorio de sesión ─────
-  try {
-    if (fs.existsSync(profileDir)) {
-      const entries = fs.readdirSync(profileDir);
-      const suspicious = entries.filter(e =>
-        /lock|Lock|singleton|Singleton/i.test(e)
-      );
-      if (suspicious.length) {
-        console.warn('[startup] ⚠️  Posibles locks restantes:', suspicious);
-      }
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+    for (const msg of messages) {
+      await handleMessage(sock, msg);
     }
-  } catch { /* ignorar */ }
+  });
+
+  return sock;
 }
 
 // ─── Arranque ─────────────────────────────────────────────────────────────────
 
 console.log('╔══════════════════════════════════════════╗');
-console.log('║   WhatsApp → Google Calendar Bot  v1.0  ║');
+console.log('║   WhatsApp → Google Calendar Bot  v2.0  ║');
+console.log('║            (Baileys — sin browser)       ║');
 console.log('╚══════════════════════════════════════════╝\n');
 
-// Verificamos que el token de Google existe antes de arrancar WhatsApp
 try {
   getCalendar();
   console.log('[startup] ✅ Credenciales de Google Calendar cargadas.\n');
@@ -691,20 +518,8 @@ try {
   process.exit(1);
 }
 
-// Limpiamos locks antes de que puppeteer intente abrir el perfil
-clearChromeLocks();
-
 // ─── Servidor HTTP de pruebas ─────────────────────────────────────────────────
 // Solo activo si TEST_PORT está definido en .env
-// Permite simular mensajes de "otro usuario" sin necesitar un segundo teléfono.
-//
-// Uso desde PowerShell / cmd:
-//   Invoke-RestMethod -Uri http://localhost:3099/test -Method POST -ContentType 'application/json' -Body '{"text":"Concierto de Vetusta Morla el 5 de abril en WiZink Center, Madrid. 21:00h"}'
-//   Invoke-RestMethod -Uri http://localhost:3099/test -Method POST -ContentType 'application/json' -Body '{"text":"https://www.ticketmaster.es/event/..."}'
-//
-// Desde bash / curl:
-//   curl -X POST http://localhost:3099/test -H 'Content-Type: application/json' \
-//        -d '{"text":"Concierto de Vetusta Morla el 5 de abril en WiZink Center"}'
 if (process.env.TEST_PORT) {
   const http = require('http');
   const PORT = parseInt(process.env.TEST_PORT);
@@ -712,7 +527,7 @@ if (process.env.TEST_PORT) {
   http.createServer((req, res) => {
     if (req.method !== 'POST' || req.url !== '/test') {
       res.writeHead(200);
-      res.end('WhatsApp Bot — test server OK. POST /test {"text":"...","type":"chat"}');
+      res.end('WhatsApp Bot v2 — test server OK. POST /test {"text":"..."}');
       return;
     }
 
@@ -720,25 +535,28 @@ if (process.env.TEST_PORT) {
     req.on('data', chunk => raw += chunk);
     req.on('end', async () => {
       try {
-        const { text = '', type = 'chat' } = JSON.parse(raw || '{}');
+        const { text = '' } = JSON.parse(raw || '{}');
 
-        // Objeto que imita la interfaz mínima de un whatsapp-web.js Message
-        const fakeMessage = {
-          body:     text,
-          from:     GROUP_ID || 'TEST_GROUP@g.us',
-          type,
-          hasMedia: false,
-          fromMe:   false,
-          getChat:    async () => ({ name: 'Grupo de prueba', isGroup: true }),
-          getContact: async () => ({ pushname: '🤖 TestUser', number: '34600000000' }),
-          downloadMedia: async () => null,
-          reply: async (txt) => {
-            console.log('\n[test] 🤖 El bot respondería:\n' + txt + '\n');
+        // Objeto mínimo que imita un mensaje de Baileys
+        const fakeMsg = {
+          key: {
+            remoteJid: GROUP_ID || 'TEST_GROUP@g.us',
+            fromMe:    false,
+            id:        `TEST_${Date.now()}`,
+          },
+          message:  { conversation: text },
+          pushName: '🤖 TestUser',
+        };
+
+        // Sock falso con sendMessage simulado
+        const fakeSock = {
+          sendMessage: async (_jid, { text: t }) => {
+            console.log('\n[test] 🤖 El bot respondería:\n' + t + '\n');
           },
         };
 
         console.log(`\n[test] 🧪 Simulando mensaje: "${text.slice(0, 80)}"`);
-        await handleMessage(fakeMessage);
+        await handleMessage(fakeSock, fakeMsg);
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
@@ -749,8 +567,11 @@ if (process.env.TEST_PORT) {
       }
     });
   }).listen(PORT, () => {
-    console.log(`[test] 🧪 Servidor de pruebas escuchando en http://localhost:${PORT}/test`);
+    console.log(`[test] 🧪 Servidor de pruebas escuchando en http://localhost:${PORT}/test\n`);
   });
 }
 
-client.initialize();
+startBot().catch(err => {
+  console.error('[startup] ❌ Error fatal al iniciar Baileys:', err.message);
+  process.exit(1);
+});

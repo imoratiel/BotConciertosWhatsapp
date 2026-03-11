@@ -4,7 +4,7 @@ Bot de Node.js que escucha un grupo de WhatsApp y agenda automáticamente concie
 
 ## Flujo principal
 
-1. **WhatsApp Web** se conecta vía `whatsapp-web.js` con sesión persistente (`LocalAuth`)
+1. **WhatsApp** se conecta vía `@whiskeysockets/baileys` (WebSocket nativo, sin browser) con sesión persistente en `.baileys_auth/`
 2. Solo se procesan mensajes del grupo configurado en `WHATSAPP_GROUP_ID`
 3. **Groq** analiza imágenes (vision), links (scraping) y texto para detectar anuncios de conciertos
 4. Se comprueba si el evento ya existe en el calendario (deduplicación por título + día)
@@ -15,7 +15,7 @@ Bot de Node.js que escucha un grupo de WhatsApp y agenda automáticamente concie
 
 - [index.js](index.js) — Lógica principal: WhatsApp client, procesamiento de mensajes, integración con Groq y Google Calendar
 - [auth.js](auth.js) — Flujo OAuth2 para Google Calendar; exporta `getAuthenticatedClient()`
-- [Dockerfile](Dockerfile) — Imagen basada en `ghcr.io/puppeteer/puppeteer:22` (Chrome preinstalado)
+- [Dockerfile](Dockerfile) — Imagen basada en `node:20-slim` (sin Chrome, Baileys no lo necesita)
 - [.env.example](.env.example) — Variables de entorno requeridas
 - `processed_messages.json` — Caché en disco de IDs de mensajes procesados (TTL 7 días)
 - `credentials.json` — Credenciales OAuth2 de Google Cloud (no commitear)

@@ -8,12 +8,13 @@
     "auth": "node auth.js"
   },
   "dependencies": {
-    "whatsapp-web.js": "^1.23.0",
-    "googleapis": "^140.0.0",
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "dotenv": "^16.4.5",
-    "qrcode-terminal": "^0.12.0",
+    "googleapis": "^140.0.0",
+    "groq-sdk": "^0.9.0",
     "open": "^10.1.0",
-    "groq-sdk": "^0.9.0"
+    "pino": "^10.3.1",
+    "qrcode-terminal": "^0.12.0"
   },
   "engines": {
     "node": ">=18.0.0"

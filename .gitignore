@@ -8,6 +8,7 @@ token.json
 # Sesión de WhatsApp (puede contener datos sensibles)
 .wwebjs_auth/
 .wwebjs_cache/
+.baileys_auth/
 
 # Logs
 bot.log
