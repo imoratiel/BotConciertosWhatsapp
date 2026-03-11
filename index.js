@@ -49,6 +49,47 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 // ─── Cliente Groq (singleton) ─────────────────────────────────────────────────
 const groq = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY }) : null;
 
+// ─── Deduplicación de mensajes ────────────────────────────────────────────────
+
+const PROCESSED_FILE = path.join(__dirname, 'processed_messages.json');
+// Cuántos días guardar IDs (evita que el archivo crezca indefinidamente)
+const PROCESSED_TTL_DAYS = 7;
+
+/**
+ * Carga los IDs de mensajes ya procesados desde disco.
+ * Formato: { "msgId": timestampMs, ... }
+ */
+function loadProcessedIds() {
+  try {
+    if (fs.existsSync(PROCESSED_FILE)) {
+      return JSON.parse(fs.readFileSync(PROCESSED_FILE, 'utf8'));
+    }
+  } catch (e) {
+    console.warn('[dedup] ⚠️  No se pudo leer processed_messages.json:', e.message);
+  }
+  return {};
+}
+
+/**
+ * Guarda el mapa de IDs procesados en disco, descartando entradas antiguas.
+ */
+function saveProcessedIds(map) {
+  const cutoff = Date.now() - PROCESSED_TTL_DAYS * 24 * 60 * 60 * 1000;
+  const pruned = Object.fromEntries(
+    Object.entries(map).filter(([, ts]) => ts > cutoff)
+  );
+  try {
+    fs.writeFileSync(PROCESSED_FILE, JSON.stringify(pruned));
+  } catch (e) {
+    console.warn('[dedup] ⚠️  No se pudo guardar processed_messages.json:', e.message);
+  }
+  return pruned;
+}
+
+// Mapa en memoria { msgId → timestampMs }
+let processedIds = loadProcessedIds();
+console.log(`[dedup] 📋 IDs procesados en caché: ${Object.keys(processedIds).length}`);
+
 // ─── Utilidades ───────────────────────────────────────────────────────────────
 
 /**
@@ -452,6 +493,17 @@ client.on('disconnected', (reason) => {
  */
 async function handleMessage(message) {
   try {
+    // ── Deduplicación por ID de mensaje ───────────────────────────────────────
+    const msgId = message.id?._serialized;
+    if (msgId) {
+      if (processedIds[msgId]) {
+        console.log(`[dedup] ⏭️  Mensaje ya procesado, ignorando: ${msgId}`);
+        return;
+      }
+      processedIds[msgId] = Date.now();
+      processedIds = saveProcessedIds(processedIds);
+    }
+
     const body    = message.body?.trim();
     // Para mensajes propios, 'from' es tu número; el chat real está en 'to'.
     // Para mensajes ajenos, 'from' ES el chat (grupo o contacto).
