@@ -479,6 +479,20 @@ async function startBot() {
       console.log(`[whatsapp]    Grupo vigilado  : ${GROUP_ID || '(ninguno configurado)'}`);
       console.log(`[whatsapp]    Calendario      : ${CALENDAR_ID}`);
       console.log('[whatsapp]    Escuchando mensajes...\n');
+
+      // Listar grupos disponibles para facilitar la configuración de WHATSAPP_GROUP_ID
+      try {
+        const chats = await sock.groupFetchAllParticipating();
+        const groups = Object.values(chats);
+        console.log(`[whatsapp] 📋 Grupos disponibles (${groups.length}):`);
+        groups.forEach(g => {
+          const marker = g.id === GROUP_ID ? ' ← VIGILADO' : '';
+          console.log(`[whatsapp]    ${g.id}  "${g.subject}"${marker}`);
+        });
+        console.log('');
+      } catch (err) {
+        console.warn('[whatsapp] ⚠️  No se pudieron listar los grupos:', err.message);
+      }
     }
 
     if (connection === 'close') {

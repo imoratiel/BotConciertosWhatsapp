@@ -13,14 +13,13 @@ services:
     # ── Volúmenes ───────────────────────────────────────────────────────────
     volumes:
       # Sesión de WhatsApp: volumen Docker nombrado → sobrevive a reinicios
-      # Ruta dentro del contenedor: WORKDIR de la imagen puppeteer oficial
-      - whatsapp_session:/home/pptruser/app/.wwebjs_auth
+      - whatsapp_session:/app/.baileys_auth
 
       # Credenciales de Google: montadas en modo solo lectura desde el host
-      - ./credentials.json:/home/pptruser/app/credentials.json:ro
+      - ./credentials.json:/app/credentials.json:ro
 
       # Token de Google: lectura/escritura para que se pueda renovar automáticamente
-      - ./token.json:/home/pptruser/app/token.json
+      - ./token.json:/app/token.json
 
     # ── Puerto de pruebas (solo si TEST_PORT está en .env) ───────────────────
     ports:
