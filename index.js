@@ -44,6 +44,7 @@ const LOG_FILE = path.join(__dirname, 'bot.log');
 });
 
 const SESSION_DIR = path.join(__dirname, '.baileys_auth');
+const GROQ_IPS_FILE = path.join(__dirname, '.groq-ips.json');
 
 // ─── Variables de entorno ─────────────────────────────────────────────────────
 const TIMEZONE    = process.env.TIMEZONE            || 'Europe/Madrid';
@@ -128,6 +129,7 @@ function concertPrompt(todayStr, extra = '') {
     `Si el contenido NO es un anuncio de concierto o evento musical, responde exactamente con la palabra: null\n\n` +
     `Si SÍ es un anuncio, responde ÚNICAMENTE con este JSON (sin texto adicional, sin markdown):\n` +
     `{\n` +
+    `  "artist": "Nombre del artista o banda (solo el nombre, sin tour ni año)",\n` +
     `  "summary": "Artista / banda — Nombre del tour (si existe)",\n` +
     `  "venue": "Nombre del recinto o null",\n` +
     `  "city": "Ciudad o null",\n` +
@@ -165,6 +167,7 @@ function buildEventFromJson(parsed, description) {
   const venue = [parsed.venue, parsed.city].filter(v => v && v !== 'null').join(', ');
 
   return {
+    artist:        parsed.artist || null,
     summary:       `[IA] ${parsed.summary || 'Concierto'}`,
     description:   description + (venue ? `\n\nRecinto: ${venue}` : ''),
     startDateTime: toLocalISOString(startDate),
@@ -298,6 +301,9 @@ async function createCalendarEvent(eventData) {
     description: eventData.description,
     start: { dateTime: eventData.startDateTime, timeZone: TIMEZONE },
     end:   { dateTime: eventData.endDateTime,   timeZone: TIMEZONE },
+    ...(eventData.artist && {
+      extendedProperties: { private: { artist: eventData.artist.toLowerCase().trim() } },
+    }),
     reminders: {
       useDefault: false,
       overrides: [
@@ -318,7 +324,7 @@ async function createCalendarEvent(eventData) {
   return created.htmlLink;
 }
 
-async function isDuplicateEvent(summary, startDateTime) {
+async function isDuplicateEvent(summary, startDateTime, artist) {
   const calendar = getCalendar();
   const start    = new Date(startDateTime);
 
@@ -330,15 +336,28 @@ async function isDuplicateEvent(summary, startDateTime) {
       calendarId:   CALENDAR_ID,
       timeMin:      dayStart.toISOString(),
       timeMax:      dayEnd.toISOString(),
-      q:            summary,
       singleEvents: true,
-      maxResults:   20,
+      maxResults:   50,
     });
 
-    const match = (res.data.items || []).find(
-      e => e.summary?.toLowerCase().trim() === summary.toLowerCase().trim()
-    );
-    if (match) console.log(`[calendar] ⚠️  Duplicado encontrado: "${match.summary}" (${match.htmlLink})`);
+    const items = res.data.items || [];
+
+    // Comparar por artista guardado en extendedProperties (más robusto)
+    if (artist) {
+      const artistNorm = artist.toLowerCase().trim();
+      const match = items.find(e =>
+        e.extendedProperties?.private?.artist === artistNorm
+      );
+      if (match) {
+        console.log(`[calendar] ⚠️  Duplicado por artista: "${match.summary}" (${match.htmlLink})`);
+        return match;
+      }
+    }
+
+    // Fallback: comparar por título completo (eventos creados antes de este cambio)
+    const summaryNorm = summary.toLowerCase().trim();
+    const match = items.find(e => e.summary?.toLowerCase().trim() === summaryNorm);
+    if (match) console.log(`[calendar] ⚠️  Duplicado por título: "${match.summary}" (${match.htmlLink})`);
     return match || null;
   } catch (err) {
     console.warn('[calendar] No se pudo comprobar duplicados:', err.message);
@@ -414,7 +433,7 @@ async function handleMessage(sock, msg) {
     }
 
     // ── Comprobar duplicado ───────────────────────────────────────────────────
-    const existing = await isDuplicateEvent(eventData.summary, eventData.startDateTime);
+    const existing = await isDuplicateEvent(eventData.summary, eventData.startDateTime, eventData.artist);
     if (existing) {
       const dupMsg =
         `ℹ️ Este evento ya está en el calendario:\n` +
@@ -448,6 +467,41 @@ async function handleMessage(sock, msg) {
   }
 }
 
+// ─── Monitor de IPs de Groq ───────────────────────────────────────────────────
+
+async function checkGroqIPs(sock) {
+  try {
+    const { resolve4 } = require('dns').promises;
+    const current = (await resolve4('api.groq.com')).sort();
+
+    let previous = [];
+    if (fs.existsSync(GROQ_IPS_FILE)) {
+      previous = JSON.parse(fs.readFileSync(GROQ_IPS_FILE, 'utf8')).sort();
+    }
+
+    const added   = current.filter(ip => !previous.includes(ip));
+    const removed = previous.filter(ip => !current.includes(ip));
+
+    fs.writeFileSync(GROQ_IPS_FILE, JSON.stringify(current));
+
+    if (added.length === 0 && removed.length === 0) return;
+
+    const lines = [
+      '⚠️ *Las IPs de Groq han cambiado* — actualiza el split tunneling de ProtonVPN:',
+      removed.length ? `❌ Eliminadas: ${removed.join(', ')}` : '',
+      added.length   ? `✅ Nuevas:     ${added.join(', ')}` : '',
+    ].filter(Boolean).join('\n');
+
+    console.warn('[groq-ip] ⚠️  Cambio de IPs detectado:', lines);
+
+    if (sock && GROUP_ID) {
+      await sock.sendMessage(GROUP_ID, { text: lines }).catch(() => {});
+    }
+  } catch (err) {
+    console.warn('[groq-ip] No se pudo comprobar IPs:', err.message);
+  }
+}
+
 // ─── WhatsApp Client (Baileys) ────────────────────────────────────────────────
 
 async function startBot() {
@@ -475,6 +529,10 @@ async function startBot() {
     }
 
     if (connection === 'open') {
+      // Comprobar IPs de Groq al arrancar y cada 6 horas
+      checkGroqIPs(sock);
+      setInterval(() => checkGroqIPs(sock), 6 * 60 * 60 * 1000);
+
       console.log('\n[whatsapp] ✅ Bot conectado y listo.');
       console.log(`[whatsapp]    Grupo vigilado  : ${GROUP_ID || '(ninguno configurado)'}`);
       console.log(`[whatsapp]    Calendario      : ${CALENDAR_ID}`);
