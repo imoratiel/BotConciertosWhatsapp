@@ -5,8 +5,7 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install --omit=dev --no-fund --no-audit
 
-COPY index.js auth.js ./
+COPY index.js auth.js entrypoint.sh ./
+RUN sed -i 's/\r//' entrypoint.sh && chmod +x entrypoint.sh
 
-RUN mkdir -p /app/.baileys_auth
-
-CMD ["node", "index.js"]
+CMD ["sh", "/app/entrypoint.sh"]

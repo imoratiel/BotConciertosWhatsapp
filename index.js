@@ -44,7 +44,7 @@ const LOG_FILE = path.join(__dirname, 'bot.log');
 });
 
 const SESSION_DIR = path.join(__dirname, '.baileys_auth');
-const GROQ_IPS_FILE = path.join(__dirname, '.groq-ips.json');
+
 
 // ─── Variables de entorno ─────────────────────────────────────────────────────
 const TIMEZONE    = process.env.TIMEZONE            || 'Europe/Madrid';
@@ -377,6 +377,7 @@ async function handleMessage(sock, msg) {
     const fromMe = key.fromMe;
 
     // ── Filtro: solo el grupo vigilado ────────────────────────────────────────
+    console.log(`[debug] mensaje de chatId: ${chatId} | GROUP_ID: ${GROUP_ID} | match: ${chatId === GROUP_ID}`);
     if (!GROUP_ID || chatId !== GROUP_ID) return;
 
     // ── Deduplicación ─────────────────────────────────────────────────────────
@@ -469,38 +470,6 @@ async function handleMessage(sock, msg) {
 
 // ─── Monitor de IPs de Groq ───────────────────────────────────────────────────
 
-async function checkGroqIPs(sock) {
-  try {
-    const { resolve4 } = require('dns').promises;
-    const current = (await resolve4('api.groq.com')).sort();
-
-    let previous = [];
-    if (fs.existsSync(GROQ_IPS_FILE)) {
-      previous = JSON.parse(fs.readFileSync(GROQ_IPS_FILE, 'utf8')).sort();
-    }
-
-    const added   = current.filter(ip => !previous.includes(ip));
-    const removed = previous.filter(ip => !current.includes(ip));
-
-    fs.writeFileSync(GROQ_IPS_FILE, JSON.stringify(current));
-
-    if (added.length === 0 && removed.length === 0) return;
-
-    const lines = [
-      '⚠️ *Las IPs de Groq han cambiado* — actualiza el split tunneling de ProtonVPN:',
-      removed.length ? `❌ Eliminadas: ${removed.join(', ')}` : '',
-      added.length   ? `✅ Nuevas:     ${added.join(', ')}` : '',
-    ].filter(Boolean).join('\n');
-
-    console.warn('[groq-ip] ⚠️  Cambio de IPs detectado:', lines);
-
-    if (sock && GROUP_ID) {
-      await sock.sendMessage(GROUP_ID, { text: lines }).catch(() => {});
-    }
-  } catch (err) {
-    console.warn('[groq-ip] No se pudo comprobar IPs:', err.message);
-  }
-}
 
 // ─── WhatsApp Client (Baileys) ────────────────────────────────────────────────
 
@@ -530,8 +499,8 @@ async function startBot() {
 
     if (connection === 'open') {
       // Comprobar IPs de Groq al arrancar y cada 6 horas
-      checkGroqIPs(sock);
-      setInterval(() => checkGroqIPs(sock), 6 * 60 * 60 * 1000);
+      // checkGroqIPs(sock);
+      // setInterval(() => checkGroqIPs(sock), 6 * 60 * 60 * 1000);
 
       console.log('\n[whatsapp] ✅ Bot conectado y listo.');
       console.log(`[whatsapp]    Grupo vigilado  : ${GROUP_ID || '(ninguno configurado)'}`);
