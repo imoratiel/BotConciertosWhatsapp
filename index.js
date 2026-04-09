@@ -15,6 +15,10 @@
 
 require('dotenv').config();
 
+// Añadir timestamp a todos los logs
+const _origLog = console.log.bind(console);
+console.log = (...args) => _origLog(`[${new Date().toISOString()}]`, ...args);
+
 const path = require('path');
 const fs   = require('fs');
 const {
