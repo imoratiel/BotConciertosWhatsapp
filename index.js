@@ -91,6 +91,11 @@ function saveProcessedIds(map) {
 let processedIds = loadProcessedIds();
 console.log(`[dedup] 📋 IDs procesados en caché: ${Object.keys(processedIds).length}`);
 
+// ─── Confirmaciones pendientes ────────────────────────────────────────────────
+
+const CONFIRMATION_TTL_MS = 5 * 60 * 1000; // 5 minutos
+const pendingConfirmations = new Map(); // chatId → { eventData, expiresAt }
+
 // ─── Utilidades ───────────────────────────────────────────────────────────────
 
 function humanDelay(minSec = 5, maxSec = 12) {
@@ -176,7 +181,77 @@ function buildEventFromJson(parsed, description) {
     description:   description + (venue ? `\n\nRecinto: ${venue}` : ''),
     startDateTime: toLocalISOString(startDate),
     endDateTime:   toLocalISOString(endDate),
+    venue:         venue || null,
   };
+}
+
+function formatEventForConfirmation(eventData) {
+  const dateStr = eventData.startDateTime.slice(0, 10);
+  const timeStr = eventData.startDateTime.slice(11, 16);
+  const lines = [
+    `🎵 *He detectado este concierto:*`,
+    ``,
+    `👤 *Artista:* ${eventData.artist || 'Desconocido'}`,
+    `📅 *Fecha:* ${dateStr}`,
+    `🕐 *Hora:* ${timeStr}`,
+  ];
+  if (eventData.venue) lines.push(`📍 *Recinto:* ${eventData.venue}`);
+  lines.push(``);
+  lines.push(`¿Lo añado al calendario? Responde *sí* para confirmar o *no* para cancelar.`);
+  lines.push(`Si algo no es correcto, escribe los datos correctos y lo ajustaré.`);
+  return lines.join('\n');
+}
+
+async function handleConfirmationReply(sock, chatId, replyText, pending, quotedMsg) {
+  const normalized = replyText.toLowerCase().trim();
+
+  if (['sí', 'si', 'yes', 's', 'y'].includes(normalized)) {
+    pendingConfirmations.delete(chatId);
+
+    const existing = await isDuplicateEvent(pending.eventData.summary, pending.eventData.startDateTime, pending.eventData.artist);
+    if (existing) {
+      const dupMsg =
+        `ℹ️ Este evento ya está en el calendario:\n` +
+        `*${existing.summary}*\n` +
+        `📅 ${pending.eventData.startDateTime.slice(0, 10)}\n` +
+        `🔗 ${existing.htmlLink}`;
+      await humanDelay(1, 3);
+      await sock.sendMessage(chatId, { text: dupMsg }, { quoted: quotedMsg }).catch(() => {});
+      return;
+    }
+
+    const eventLink = await createCalendarEvent(pending.eventData);
+    const successMsg =
+      `✅ *Evento agendado:* ${pending.eventData.summary}\n` +
+      `📅 *Inicio:* ${pending.eventData.startDateTime}\n` +
+      `🔚 *Fin:*   ${pending.eventData.endDateTime}\n` +
+      `🔗 ${eventLink}`;
+    console.log('[bot] ✅ Confirmado y agendado:', pending.eventData.summary);
+    await humanDelay(1, 3);
+    await sock.sendMessage(chatId, { text: successMsg }, { quoted: quotedMsg }).catch(() => {});
+
+  } else if (['no', 'n', 'cancelar', 'cancel'].includes(normalized)) {
+    pendingConfirmations.delete(chatId);
+    console.log('[bot] ❌ Evento cancelado por el usuario.');
+    await humanDelay(1, 3);
+    await sock.sendMessage(chatId, { text: '❌ Evento cancelado. No se ha añadido nada al calendario.' }, { quoted: quotedMsg }).catch(() => {});
+
+  } else {
+    // Tratar como corrección: re-parsear con Groq
+    console.log('[bot] ✏️  Procesando corrección del usuario...');
+    const correctedEvent = await parseTextWithGroq(replyText);
+    if (correctedEvent) {
+      pendingConfirmations.set(chatId, { eventData: correctedEvent, expiresAt: Date.now() + CONFIRMATION_TTL_MS });
+      const confirmMsg = `✏️ He actualizado los datos:\n\n${formatEventForConfirmation(correctedEvent)}`;
+      await humanDelay(1, 3);
+      await sock.sendMessage(chatId, { text: confirmMsg }, { quoted: quotedMsg }).catch(() => {});
+    } else {
+      await humanDelay(1, 3);
+      await sock.sendMessage(chatId, {
+        text: '❓ No he podido entender la corrección. Responde *sí* para confirmar, *no* para cancelar, o describe los datos correctos.',
+      }, { quoted: quotedMsg }).catch(() => {});
+    }
+  }
 }
 
 function parseGroqResponse(rawText) {
@@ -384,6 +459,9 @@ async function handleMessage(sock, msg) {
     console.log(`[debug] mensaje de chatId: ${chatId} | GROUP_ID: ${GROUP_ID} | match: ${chatId === GROUP_ID}`);
     if (!GROUP_ID || chatId !== GROUP_ID) return;
 
+    // ── Ignorar mensajes propios del bot ─────────────────────────────────────
+    if (fromMe) return;
+
     // ── Deduplicación ─────────────────────────────────────────────────────────
     const msgId = key.id;
     if (msgId) {
@@ -409,6 +487,18 @@ async function handleMessage(sock, msg) {
     const typeLabel  = isImage ? '🖼️  imagen' : (urls.length ? '🔗 link' : '📝 texto');
 
     console.log(`\n[bot] 📨 ${senderName} | ${typeLabel} | "${body.slice(0, 60)}"`);
+
+    // ── Comprobar si hay una confirmación pendiente ───────────────────────────
+    const pending = pendingConfirmations.get(chatId);
+    if (pending) {
+      if (Date.now() > pending.expiresAt) {
+        pendingConfirmations.delete(chatId);
+        console.log('[bot] ⏰ Confirmación expirada, procesando como nuevo mensaje.');
+      } else {
+        await handleConfirmationReply(sock, chatId, body, pending, msg);
+        return;
+      }
+    }
 
     // ── Extraer datos del evento ──────────────────────────────────────────────
     let eventData = null;
@@ -437,7 +527,7 @@ async function handleMessage(sock, msg) {
       return;
     }
 
-    // ── Comprobar duplicado ───────────────────────────────────────────────────
+    // ── Comprobar duplicado antes de pedir confirmación ───────────────────────
     const existing = await isDuplicateEvent(eventData.summary, eventData.startDateTime, eventData.artist);
     if (existing) {
       const dupMsg =
@@ -446,26 +536,17 @@ async function handleMessage(sock, msg) {
         `📅 ${eventData.startDateTime.slice(0, 10)}\n` +
         `🔗 ${existing.htmlLink}`;
       console.log('[bot] ℹ️  Duplicado —', existing.summary);
-      if (!fromMe) {
-        await humanDelay(2, 4);
-        await sock.sendMessage(chatId, { text: dupMsg }, { quoted: msg }).catch(() => {});
-      }
+      await humanDelay(2, 4);
+      await sock.sendMessage(chatId, { text: dupMsg }, { quoted: msg }).catch(() => {});
       return;
     }
 
-    // ── Crear el evento ───────────────────────────────────────────────────────
-    const eventLink = await createCalendarEvent(eventData);
-
-    const successMsg =
-      `✅ *Evento agendado:* ${eventData.summary}\n` +
-      `📅 *Inicio:* ${eventData.startDateTime}\n` +
-      `🔚 *Fin:*   ${eventData.endDateTime}\n` +
-      `🔗 ${eventLink}`;
-    console.log('[bot] ✅ Agendado:', eventData.summary);
-    if (!fromMe) {
-      await humanDelay();
-      await sock.sendMessage(chatId, { text: successMsg }, { quoted: msg }).catch(() => {});
-    }
+    // ── Pedir confirmación al usuario ─────────────────────────────────────────
+    pendingConfirmations.set(chatId, { eventData, expiresAt: Date.now() + CONFIRMATION_TTL_MS });
+    const confirmMsg = formatEventForConfirmation(eventData);
+    console.log('[bot] ❓ Pidiendo confirmación para:', eventData.summary);
+    await humanDelay();
+    await sock.sendMessage(chatId, { text: confirmMsg }, { quoted: msg }).catch(() => {});
 
   } catch (err) {
     console.error('[bot] ❌ Error:', err.message);
